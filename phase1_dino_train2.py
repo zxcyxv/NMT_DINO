@@ -3,14 +3,14 @@
 Phase 1: DINO Self-Supervised Pretraining for ByT5 Akkadian
 ============================================================
 Self-distillation (DINO) on unlabeled Akkadian transliterations from published_texts.csv.
-Improves encoder/decoder representations for downstream translation.
+Improves encoder representations for downstream translation.
 
-Architecture:
-  - Shared span corruption → corrupted_input_ids + span_targets
-  - Teacher (EMA, eval, no dropout): full decoder input → projection head → p_T
-  - Student (trainable, train, dropout ON):
-      DINO decoder: distance-masked decoder input → projection head → p_S → L_DINO
-      CE decoder: encoder_outputs + labels=span_targets → L_CE
+Architecture (Length-Preserving):
+  - Length-preserving corruption: ~15% of bytes → random bytes (L = L')
+  - Teacher (EMA, eval): clean input → encoder → proj head → p_T  [B, L, K]
+  - Student (trainable):  corrupted input → encoder → proj head → p_S [B, L, K]
+  - Token-wise DINO loss: -mean(sum(p_T · log(p_S)))
+  - CE loss: Student model(corrupted → reconstruct clean) via decoder
   - L_total = λ_DINO * L_DINO + λ_CE * L_CE
 """
 
@@ -23,6 +23,7 @@ import gc
 import re
 import math
 import copy
+import time
 import random
 import logging
 import argparse
@@ -44,13 +45,13 @@ from tqdm.auto import tqdm
 @dataclass
 class DINOConfig:
     # Paths
-    model_path: str = "google/byt5-large"
+    model_path: str = "byt5-akkadian-optimized-34x"
     data_path: str = "dataset/published_texts.csv"
     output_dir: str = "dino_output"
 
     # Model dimensions
-    d_model: int = 1024
-    proj_hidden: int = 2048
+    d_model: int = 1536
+    proj_hidden: int = 3072
     proj_output: int = 256
 
     # Training
@@ -73,14 +74,8 @@ class DINOConfig:
     tau_t_end: float = 0.07
     center_momentum: float = 0.9
 
-    # Span corruption
-    noise_density: float = 0.15
-    mean_span_len: int = 3
-    sentinel_start: int = 259  # ByT5 sentinel tokens start
-
-    # Distance masking
-    dist_mask_pmax: float = 0.3
-    dist_mask_gamma: float = 0.1
+    # Length-preserving corruption
+    mask_ratio: float = 0.15  # fraction of bytes to replace with random bytes
 
     # Tokenizer
     max_length: int = 512
@@ -294,189 +289,53 @@ def collate_fn(batch: List[torch.Tensor], pad_token_id: int = 0) -> torch.Tensor
 
 
 # ──────────────────────────────────────────────────────────────
-# Step 4: Byte-Level Span Corruption
+# Step 4: Length-Preserving Corruption
 # ──────────────────────────────────────────────────────────────
 
-def byte_span_corruption(
+def length_preserving_corruption(
     input_ids: torch.Tensor,
-    noise_density: float = 0.15,
-    mean_span_len: int = 3,
-    sentinel_start: int = 259,
-    eos_token_id: int = 1,
+    mask_ratio: float = 0.15,
     pad_token_id: int = 0,
+    eos_token_id: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Apply span corruption to a batch of byte sequences.
+    Replace mask_ratio fraction of content bytes with random bytes.
+    Sequence length is preserved (L = L'), enabling token-wise DINO loss.
 
     Args:
-        input_ids: [B, L] token IDs (bytes + special tokens)
+        input_ids: [B, L] token IDs (ByT5 bytes 3-258, special 0-2, sentinel 259+)
     Returns:
-        corrupted_ids: [B, L'] with sentinel tokens replacing spans
-        span_targets: [B, L''] sentinel + original bytes + EOS
+        corrupted_ids: [B, L] same length, ~15% bytes replaced
+        corruption_mask: [B, L] bool, True at corrupted positions
     """
-    batch_size, seq_len = input_ids.shape
+    B, L = input_ids.shape
     device = input_ids.device
 
-    all_corrupted = []
-    all_targets = []
+    corrupted = input_ids.clone()
+    corruption_mask = torch.zeros(B, L, dtype=torch.bool, device=device)
 
-    for b in range(batch_size):
-        # Get non-padding, non-EOS tokens
-        tokens = input_ids[b].tolist()
+    for b in range(B):
+        # Content = not pad, not eos
+        content_mask = (input_ids[b] != pad_token_id) & (input_ids[b] != eos_token_id)
+        content_indices = content_mask.nonzero(as_tuple=True)[0]
+        n_content = content_indices.numel()
 
-        # Find actual content (exclude pad=0 and eos=1 at end)
-        content_end = seq_len
-        while content_end > 0 and tokens[content_end - 1] == pad_token_id:
-            content_end -= 1
-        # Remove trailing EOS if present
-        if content_end > 0 and tokens[content_end - 1] == eos_token_id:
-            content_end -= 1
-
-        content = tokens[:content_end]
-        content_len = len(content)
-
-        if content_len < 4:
-            # Too short for corruption; use identity
-            corrupted = content + [eos_token_id]
-            target = [sentinel_start, eos_token_id]
-            all_corrupted.append(corrupted)
-            all_targets.append(target)
+        if n_content < 2:
             continue
 
-        # Number of tokens to mask
-        num_noise_tokens = max(1, round(content_len * noise_density))
-        # Number of spans
-        num_spans = max(1, round(num_noise_tokens / mean_span_len))
+        # Number of tokens to corrupt
+        n_corrupt = max(1, round(n_content * mask_ratio))
 
-        # Generate random span positions
-        # Create a noise mask
-        noise_mask = [False] * content_len
+        # Random indices to corrupt
+        perm = torch.randperm(n_content, device=device)[:n_corrupt]
+        corrupt_indices = content_indices[perm]
 
-        # Place spans randomly
-        spans_placed = 0
-        attempts = 0
-        while spans_placed < num_spans and attempts < 100:
-            # Random span length (geometric-like distribution around mean)
-            span_len = max(1, int(np.random.geometric(1.0 / mean_span_len)))
-            span_len = min(span_len, content_len - 1)
+        # Replace with random bytes (ByT5 byte range: 3-258)
+        random_bytes = torch.randint(3, 259, (n_corrupt,), device=device)
+        corrupted[b, corrupt_indices] = random_bytes
+        corruption_mask[b, corrupt_indices] = True
 
-            # Random start position
-            start = random.randint(0, content_len - span_len)
-
-            # Check if overlaps with existing span
-            overlap = False
-            for i in range(max(0, start - 1), min(content_len, start + span_len + 1)):
-                if noise_mask[i]:
-                    overlap = True
-                    break
-
-            if not overlap:
-                for i in range(start, start + span_len):
-                    noise_mask[i] = True
-                spans_placed += 1
-            attempts += 1
-
-        if spans_placed == 0:
-            # Fallback: mask a single random token
-            pos = random.randint(0, content_len - 1)
-            noise_mask[pos] = True
-
-        # Build corrupted sequence and targets
-        corrupted = []
-        target = []
-        sentinel_id = sentinel_start
-        in_span = False
-
-        for i, tok in enumerate(content):
-            if noise_mask[i]:
-                if not in_span:
-                    # Start of a new span
-                    corrupted.append(sentinel_id)
-                    target.append(sentinel_id)
-                    sentinel_id += 1
-                    in_span = True
-                target.append(tok)
-            else:
-                in_span = False
-                corrupted.append(tok)
-
-        corrupted.append(eos_token_id)
-        target.append(eos_token_id)
-
-        all_corrupted.append(corrupted)
-        all_targets.append(target)
-
-    # Pad to same length within batch
-    max_corr_len = max(len(c) for c in all_corrupted)
-    max_tgt_len = max(len(t) for t in all_targets)
-
-    corrupted_batch = torch.full((batch_size, max_corr_len), pad_token_id,
-                                 dtype=torch.long, device=device)
-    targets_batch = torch.full((batch_size, max_tgt_len), pad_token_id,
-                               dtype=torch.long, device=device)
-
-    for b in range(batch_size):
-        c = all_corrupted[b]
-        t = all_targets[b]
-        corrupted_batch[b, :len(c)] = torch.tensor(c, dtype=torch.long)
-        targets_batch[b, :len(t)] = torch.tensor(t, dtype=torch.long)
-
-    return corrupted_batch, targets_batch
-
-
-# ──────────────────────────────────────────────────────────────
-# Step 5: Decoder Distance-Proportional Masking
-# ──────────────────────────────────────────────────────────────
-
-def distance_proportional_mask(
-    decoder_input_ids: torch.Tensor,
-    pad_token_id: int = 0,
-    pmax: float = 0.3,
-    gamma: float = 0.1,
-) -> torch.Tensor:
-    """
-    Apply distance-proportional masking to decoder inputs (Student DINO only).
-    P(mask at position t for token at relative position t-j) = min(pmax, gamma * ln(1+k))
-    where k = t - j for j < t (past positions only).
-
-    We mask each position based on its distance from the current decoding position,
-    meaning earlier tokens have higher masking probability at later positions.
-    Simplified: for each position t, mask with probability based on how far it is
-    from the start. P(mask_t) = min(pmax, gamma * ln(1 + t)).
-
-    Args:
-        decoder_input_ids: [B, L] shifted-right span targets
-    Returns:
-        masked_decoder_input: [B, L] with some positions replaced by pad_token_id
-    """
-    B, L = decoder_input_ids.shape
-    device = decoder_input_ids.device
-
-    # Position indices: [L]
-    positions = torch.arange(L, device=device, dtype=torch.float32)
-
-    # Masking probability increases with position
-    # P(mask_t) = min(pmax, gamma * ln(1 + t))
-    probs = torch.clamp(gamma * torch.log1p(positions), max=pmax)
-
-    # Don't mask position 0 (decoder start token)
-    probs[0] = 0.0
-
-    # Expand to batch: [B, L]
-    probs = probs.unsqueeze(0).expand(B, -1)
-
-    # Sample mask
-    mask = torch.bernoulli(probs).bool()
-
-    # Don't mask padding positions (they're already pad)
-    is_pad = decoder_input_ids == pad_token_id
-    mask = mask & ~is_pad
-
-    # Apply mask
-    masked = decoder_input_ids.clone()
-    masked[mask] = pad_token_id
-
-    return masked
+    return corrupted, corruption_mask
 
 
 # ──────────────────────────────────────────────────────────────
@@ -484,26 +343,29 @@ def distance_proportional_mask(
 # ──────────────────────────────────────────────────────────────
 
 class DINOProjectionHead(nn.Module):
-    """DINO projection head: Linear → GELU → LayerNorm → Linear → L2 Norm."""
+    """DINO projection head: Linear → GELU → LayerNorm → L2Norm → WeightNorm Linear (g=10)."""
 
-    def __init__(self, d_model: int = 1024, hidden: int = 2048, output: int = 256):
+    def __init__(self, d_model: int = 1536, hidden: int = 3072, output: int = 256,
+                 initial_g: float = 10.0):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_model, hidden),
-            nn.GELU(),
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, output),
+        self.linear1 = nn.Linear(d_model, hidden)
+        self.act = nn.GELU()
+        self.ln = nn.LayerNorm(hidden)
+        # Weight normalization with learnable scale g, initialized large
+        self.last_layer = nn.utils.weight_norm(
+            nn.Linear(hidden, output, bias=False)
         )
+        # Initialize g large so logits have meaningful magnitude from step 0
+        # std(z) ≈ g * 1/√hidden → with g=10, std(z) ≈ 0.18 → std(z/τ) ≈ 4.5
+        self.last_layer.weight_g.data.fill_(initial_g)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, L, d_model]
-        Returns:
-            [B, L, output] L2-normalized
-        """
-        out = self.net(x)
-        return F.normalize(out, dim=-1)
+        x = self.linear1(x)
+        x = self.act(x)
+        x = self.ln(x)
+        x = F.normalize(x, dim=-1)  # L2 norm on hidden features
+        x = self.last_layer(x)      # weight_norm: g * (v/||v||) · x
+        return x
 
 
 class DINOByT5(nn.Module):
@@ -559,130 +421,158 @@ class DINOByT5(nn.Module):
         for t_param, s_param in zip(self.teacher_head.parameters(), self.student_head.parameters()):
             t_param.data.mul_(momentum).add_(s_param.data, alpha=1.0 - momentum)
 
-    def shift_right(self, labels: torch.Tensor) -> torch.Tensor:
-        """Shift labels right for decoder input (T5 style: pad token prepended)."""
-        shifted = labels.new_zeros(labels.shape)
-        shifted[:, 1:] = labels[:, :-1].clone()
-        shifted[:, 0] = self.cfg.pad_token_id  # T5 uses pad as decoder start
-        return shifted
-
     def forward(
         self,
         input_ids: torch.Tensor,
     ) -> dict:
         """
-        Full DINO forward pass.
+        Length-preserving DINO forward pass.
+
+        Teacher gets clean input, Student gets corrupted input (same length).
+        DINO loss is computed token-wise on encoder outputs.
+        CE loss: Student decoder reconstructs clean sequence from corrupted encoder.
 
         Args:
             input_ids: [B, L] raw tokenized Akkadian text
-
         Returns:
-            dict with dino_loss, ce_loss, total_loss
+            dict with dino_loss, ce_loss, total_loss, diagnostics
         """
         cfg = self.cfg
         device = input_ids.device
 
-        # ── Step 0: Span corruption (shared) ──
-        corrupted_ids, span_targets = byte_span_corruption(
+        # ── Step 0: Length-preserving corruption ──
+        corrupted_ids, corruption_mask = length_preserving_corruption(
             input_ids,
-            noise_density=cfg.noise_density,
-            mean_span_len=cfg.mean_span_len,
-            sentinel_start=cfg.sentinel_start,
+            mask_ratio=cfg.mask_ratio,
+            pad_token_id=cfg.pad_token_id,
             eos_token_id=cfg.eos_token_id,
-            pad_token_id=cfg.pad_token_id,
         )
 
-        # Attention masks
-        corrupted_attn = (corrupted_ids != cfg.pad_token_id).long()
-        target_mask = (span_targets != cfg.pad_token_id)  # [B, L_dec] bool
+        # Attention masks (same for both since length is preserved)
+        attn_mask = (input_ids != cfg.pad_token_id).long()  # [B, L]
+        valid_mask = attn_mask.bool()  # for loss computation
 
-        # Decoder inputs
-        decoder_input_clean = self.shift_right(span_targets)  # Teacher
-        decoder_input_masked = distance_proportional_mask(    # Student DINO
-            decoder_input_clean,
-            pad_token_id=cfg.pad_token_id,
-            pmax=cfg.dist_mask_pmax,
-            gamma=cfg.dist_mask_gamma,
-        )
-
-        # ── Step 1: Teacher forward (no grad, eval mode) ──
+        # ── Step 1: Teacher encoder (clean input, no grad) ──
         self.teacher.eval()
         with torch.no_grad():
             teacher_enc_out = self.teacher.encoder(
-                input_ids=corrupted_ids,
-                attention_mask=corrupted_attn,
-            ).last_hidden_state
+                input_ids=input_ids,          # CLEAN input
+                attention_mask=attn_mask,
+            ).last_hidden_state               # [B, L, D]
 
-            teacher_dec_out = self.teacher.decoder(
-                input_ids=decoder_input_clean,
-                encoder_hidden_states=teacher_enc_out,
-                encoder_attention_mask=corrupted_attn,
-            ).last_hidden_state
-
-            # Project and compute teacher distribution
-            z_T = self.teacher_head(teacher_dec_out)  # [B, L_dec, proj_output]
+            z_T = self.teacher_head(teacher_enc_out)  # [B, L, proj_output]
 
             # Centering + sharpened softmax
             z_T_centered = z_T - self.center.unsqueeze(0).unsqueeze(0)
-
-            # Get current teacher temperature (will be set externally via tau_t attr)
             tau_t = getattr(self, '_current_tau_t', cfg.tau_t_start)
-            p_T = F.softmax(z_T_centered / tau_t, dim=-1)  # [B, L_dec, proj_output]
+            p_T = F.softmax(z_T_centered / tau_t, dim=-1)  # [B, L, K]
 
             # Update center (excluding padding)
-            if target_mask.any():
-                valid_z = z_T[target_mask]  # [N_valid, proj_output]
-                batch_center = valid_z.mean(dim=0)  # [proj_output]
+            if valid_mask.any():
+                valid_z = z_T[valid_mask]  # [N_valid, K]
+                batch_center = valid_z.mean(dim=0)
                 self.center.mul_(cfg.center_momentum).add_(
                     batch_center, alpha=1.0 - cfg.center_momentum
                 )
 
-        # ── Step 2: Student encoder (single pass, cached) ──
+        # ── Step 2: Student encoder (corrupted input) ──
         self.student.train()
         student_enc_out = self.student.encoder(
-            input_ids=corrupted_ids,
-            attention_mask=corrupted_attn,
-        ).last_hidden_state
+            input_ids=corrupted_ids,          # CORRUPTED input
+            attention_mask=attn_mask,
+        ).last_hidden_state                   # [B, L, D] — same L!
 
-        # ── Step 3: Student DINO decoder ──
-        student_dec_out = self.student.decoder(
-            input_ids=decoder_input_masked,
-            encoder_hidden_states=student_enc_out,
-            encoder_attention_mask=corrupted_attn,
-            output_hidden_states=True,
-        )
-        # Use last hidden state
-        student_hidden = student_dec_out.last_hidden_state  # [B, L_dec, d_model]
-        z_S = self.student_head(student_hidden)  # [B, L_dec, proj_output]
+        z_S = self.student_head(student_enc_out)  # [B, L, K]
+        p_S = F.log_softmax(z_S / cfg.tau_s, dim=-1)
 
-        # Student log-softmax
-        p_S = F.log_softmax(z_S / cfg.tau_s, dim=-1)  # [B, L_dec, proj_output]
-
-        # DINO loss: cross-entropy between teacher and student distributions
-        per_token_loss = -(p_T * p_S).sum(dim=-1)  # [B, L_dec]
-
-        if target_mask.any():
-            dino_loss = per_token_loss[target_mask].mean()
+        # ── Step 3: Token-wise DINO loss ──
+        per_token_loss = -(p_T * p_S).sum(dim=-1)  # [B, L]
+        if valid_mask.any():
+            dino_loss = per_token_loss[valid_mask].mean()
         else:
             dino_loss = per_token_loss.mean()
 
-        # ── Step 4: Student CE decoder ──
-        # Use HuggingFace's built-in CE loss (internally does shift-right + cross-entropy)
+        # ── Step 4: CE loss (decoder reconstructs clean from corrupted) ──
+        # labels = original clean input_ids
+        # HF T5 internally: shifts labels right for decoder input, computes CE
+        ce_labels = input_ids.clone()
+        ce_labels[~valid_mask] = -100  # ignore padding in CE
+
         ce_output = self.student(
             input_ids=corrupted_ids,
-            attention_mask=corrupted_attn,
-            labels=span_targets,
-            encoder_outputs=(student_enc_out,),  # Reuse cached encoder output
+            attention_mask=attn_mask,
+            labels=ce_labels,
+            encoder_outputs=(student_enc_out,),  # reuse cached encoder
         )
         ce_loss = ce_output.loss
 
         # ── Step 5: Total loss ──
         total_loss = cfg.lambda_dino * dino_loss + cfg.lambda_ce * ce_loss
 
+        # ── Diagnostics (detached, no grad impact) ──
+        with torch.no_grad():
+            ln_K = math.log(cfg.proj_output)
+
+            p_S_probs = F.softmax(z_S / cfg.tau_s, dim=-1)
+            H_T = -(p_T * (p_T + 1e-10).log()).sum(dim=-1)
+            H_S = -(p_S_probs * (p_S_probs + 1e-10).log()).sum(dim=-1)
+            if valid_mask.any():
+                H_norm_T = (H_T[valid_mask].mean() / ln_K).item()
+                H_norm_S = (H_S[valid_mask].mean() / ln_K).item()
+            else:
+                H_norm_T = (H_T.mean() / ln_K).item()
+                H_norm_S = (H_S.mean() / ln_K).item()
+
+            z_T_valid = z_T[valid_mask] if valid_mask.any() else z_T.reshape(-1, z_T.size(-1))
+            z_S_valid = z_S[valid_mask] if valid_mask.any() else z_S.reshape(-1, z_S.size(-1))
+
+            std_z_T = z_T_valid.std().item()
+            std_z_S = z_S_valid.std().item()
+            abs_z_T = z_T_valid.abs().mean().item()
+            abs_z_S = z_S_valid.abs().mean().item()
+
+            center_norm = self.center.norm().item()
+            mean_z_T_norm = z_T_valid.norm(dim=-1).mean().item()
+            R_C = center_norm / max(mean_z_T_norm, 1e-10)
+
+            # Intra-batch cosine similarity (per-sample mean pooled)
+            B = z_T.size(0)
+            sample_vecs = []
+            for b in range(B):
+                mb = valid_mask[b]
+                if mb.any():
+                    sample_vecs.append(z_T[b][mb].mean(dim=0))
+            if len(sample_vecs) >= 2:
+                vecs = torch.stack(sample_vecs)
+                vecs_norm = F.normalize(vecs, dim=-1)
+                cos_matrix = vecs_norm @ vecs_norm.T
+                n = cos_matrix.size(0)
+                off_diag = cos_matrix[~torch.eye(n, dtype=torch.bool, device=device)]
+                S_cos = off_diag.mean().item()
+            else:
+                S_cos = 0.0
+
+            # Corruption stats
+            n_corrupted = corruption_mask.sum().item()
+            n_total_tokens = valid_mask.sum().item()
+
+        diagnostics = {
+            "H_norm_T": H_norm_T,
+            "H_norm_S": H_norm_S,
+            "std_z_T": std_z_T,
+            "std_z_S": std_z_S,
+            "abs_z_T": abs_z_T,
+            "abs_z_S": abs_z_S,
+            "R_C": R_C,
+            "S_cos": S_cos,
+            "corrupt_ratio": n_corrupted / max(n_total_tokens, 1),
+        }
+
         return {
             "total_loss": total_loss,
             "dino_loss": dino_loss.detach(),
             "ce_loss": ce_loss.detach(),
+            "diagnostics": diagnostics,
         }
 
 
@@ -715,6 +605,28 @@ def get_teacher_temp(step: int, total_steps: int, t_start: float, t_end: float) 
     return t_end
 
 
+def fmt_time(seconds: float) -> str:
+    """Format seconds into human-readable string."""
+    if seconds < 0:
+        return "--:--:--"
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    return f"{m}m {s:02d}s"
+
+
+def gpu_mem_info() -> str:
+    """Get GPU memory usage string."""
+    if not torch.cuda.is_available():
+        return "CPU"
+    used = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    return f"{used:.1f}GB/{total:.0f}GB (reserved {reserved:.1f}GB)"
+
+
 def train(cfg: DINOConfig):
     logger = setup_logging(cfg.output_dir)
     set_seed(cfg.seed)
@@ -722,9 +634,24 @@ def train(cfg: DINOConfig):
     logger.info("=" * 60)
     logger.info("DINO Self-Supervised Pretraining for ByT5 Akkadian")
     logger.info("=" * 60)
-    logger.info(f"Config: {vars(cfg)}")
 
     device = torch.device(cfg.device)
+
+    # Print config summary
+    logger.info(f"  Model       : {cfg.model_path}")
+    logger.info(f"  Data        : {cfg.data_path}")
+    logger.info(f"  Output      : {cfg.output_dir}")
+    logger.info(f"  Batch       : {cfg.batch_size} x {cfg.grad_accum} accum = {cfg.batch_size * cfg.grad_accum} effective")
+    logger.info(f"  Epochs      : {cfg.epochs}")
+    logger.info(f"  LR          : {cfg.lr}")
+    logger.info(f"  Loss weights: DINO={cfg.lambda_dino}, CE={cfg.lambda_ce}")
+    logger.info(f"  EMA base    : {cfg.ema_base}")
+    logger.info(f"  Temps       : student={cfg.tau_s}, teacher={cfg.tau_t_start}->{cfg.tau_t_end}")
+    logger.info(f"  Device      : {device} | BF16: {cfg.use_bf16}")
+    if torch.cuda.is_available():
+        logger.info(f"  GPU         : {torch.cuda.get_device_name(0)}")
+        logger.info(f"  GPU Memory  : {gpu_mem_info()}")
+    logger.info("=" * 60)
 
     # Load tokenizer
     logger.info(f"Loading tokenizer from {cfg.model_path}")
@@ -745,6 +672,8 @@ def train(cfg: DINOConfig):
 
     # Create model
     model = DINOByT5(cfg, logger).to(device)
+    if torch.cuda.is_available():
+        logger.info(f"  After model load: {gpu_mem_info()}")
 
     # Optimizer: only student + student_head parameters
     optimizer_params = [
@@ -759,27 +688,40 @@ def train(cfg: DINOConfig):
     )
 
     # Scheduler
-    steps_per_epoch = len(dataloader) // cfg.grad_accum
+    batches_per_epoch = len(dataloader)
+    steps_per_epoch = batches_per_epoch // cfg.grad_accum
     total_steps = steps_per_epoch * cfg.epochs
+    total_batches = batches_per_epoch * cfg.epochs
     warmup_steps = int(cfg.warmup_ratio * total_steps)
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
-    logger.info(f"Steps/epoch: {steps_per_epoch}, Total steps: {total_steps}, "
-                f"Warmup: {warmup_steps}")
+    logger.info(f"  Samples     : {len(dataset)}")
+    logger.info(f"  Batches/ep  : {batches_per_epoch}")
+    logger.info(f"  Steps/ep    : {steps_per_epoch} (after {cfg.grad_accum}x accum)")
+    logger.info(f"  Total steps : {total_steps}")
+    logger.info(f"  Warmup steps: {warmup_steps}")
+    logger.info("=" * 60)
 
     # Mixed precision
     use_amp = cfg.use_bf16 and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     amp_dtype = torch.bfloat16 if use_amp else torch.float32
 
-    logger.info(f"AMP: {use_amp}, dtype: {amp_dtype}")
-
-    # Training
+    # ── Training ──
     global_step = 0
+    global_batch = 0
+    train_start = time.time()
     optimizer.zero_grad()
 
+    # Running loss trackers (for smoothed display)
+    running_dino = 0.0
+    running_ce = 0.0
+    running_total = 0.0
+    running_count = 0
+    prev_dino_loss = None  # For collapse detection
+
     for epoch in range(cfg.epochs):
-        logger.info(f"Epoch {epoch + 1}/{cfg.epochs}")
+        epoch_start = time.time()
         model.student.train()
         model.student_head.train()
         model.teacher.eval()
@@ -788,10 +730,17 @@ def train(cfg: DINOConfig):
         epoch_dino_loss = 0.0
         epoch_ce_loss = 0.0
         epoch_total_loss = 0.0
+        epoch_dino_min = float("inf")
+        epoch_dino_max = float("-inf")
         num_batches = 0
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}")
+        pbar = tqdm(
+            dataloader,
+            desc=f"Epoch {epoch + 1}/{cfg.epochs}",
+            bar_format="{l_bar}{bar:20}{r_bar}",
+        )
         for batch_idx, input_ids in enumerate(pbar):
+            batch_start = time.time()
             input_ids = input_ids.to(device, non_blocking=True)
 
             # Set current teacher temperature
@@ -808,19 +757,38 @@ def train(cfg: DINOConfig):
             scaler.scale(loss).backward()
 
             # Accumulate metrics
-            epoch_dino_loss += losses["dino_loss"].item()
-            epoch_ce_loss += losses["ce_loss"].item()
-            epoch_total_loss += losses["total_loss"].item()
+            dino_val = losses["dino_loss"].item()
+            ce_val = losses["ce_loss"].item()
+            total_val = losses["total_loss"].item()
+            diag = losses.get("diagnostics", {})
+
+            epoch_dino_loss += dino_val
+            epoch_ce_loss += ce_val
+            epoch_total_loss += total_val
+            epoch_dino_min = min(epoch_dino_min, dino_val)
+            epoch_dino_max = max(epoch_dino_max, dino_val)
             num_batches += 1
+            global_batch += 1
+
+            # Smoothed running averages (last ~50 batches)
+            running_dino += dino_val
+            running_ce += ce_val
+            running_total += total_val
+            running_count += 1
+            if running_count > 50:
+                running_dino -= running_dino / running_count
+                running_ce -= running_ce / running_count
+                running_total -= running_total / running_count
+                running_count -= 1
 
             # Gradient accumulation step
             if (batch_idx + 1) % cfg.grad_accum == 0:
                 # Gradient clipping
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     list(model.student.parameters()) + list(model.student_head.parameters()),
                     cfg.max_grad_norm,
-                )
+                ).item()
 
                 scaler.step(optimizer)
                 scaler.update()
@@ -833,53 +801,123 @@ def train(cfg: DINOConfig):
 
                 global_step += 1
 
-                # Logging
-                if global_step % cfg.log_every_steps == 0:
-                    avg_dino = epoch_dino_loss / num_batches
-                    avg_ce = epoch_ce_loss / num_batches
-                    avg_total = epoch_total_loss / num_batches
-                    lr_now = scheduler.get_last_lr()[0]
-                    tau_t = model._current_tau_t
+            # ── Progress bar update (every batch) ──
+            elapsed = time.time() - train_start
+            batches_done = global_batch
+            batches_left = total_batches - batches_done
+            if batches_done > 0:
+                secs_per_batch = elapsed / batches_done
+                eta_seconds = batches_left * secs_per_batch
+                samples_per_sec = (batches_done * cfg.batch_size) / elapsed
+            else:
+                eta_seconds = -1
+                samples_per_sec = 0
 
-                    pbar.set_postfix({
-                        "step": global_step,
-                        "dino": f"{avg_dino:.4f}",
-                        "ce": f"{avg_ce:.4f}",
-                        "lr": f"{lr_now:.2e}",
-                        "ema": f"{ema_m:.4f}",
-                        "τT": f"{tau_t:.4f}",
-                    })
+            smooth_dino = running_dino / max(1, running_count)
+            smooth_ce = running_ce / max(1, running_count)
+
+            pbar.set_postfix_str(
+                f"DINO={smooth_dino:.3f} CE={smooth_ce:.3f} "
+                f"lr={scheduler.get_last_lr()[0]:.1e} "
+                f"ETA={fmt_time(eta_seconds)} "
+                f"{samples_per_sec:.1f}smp/s"
+            )
+
+            # ── Detailed logging ──
+            if global_step > 0 and global_step % cfg.log_every_steps == 0 and (batch_idx + 1) % cfg.grad_accum == 0:
+                avg_dino = epoch_dino_loss / num_batches
+                avg_ce = epoch_ce_loss / num_batches
+                avg_total = epoch_total_loss / num_batches
+                lr_now = scheduler.get_last_lr()[0]
+                tau_t = model._current_tau_t
+                center_norm = model.center.norm().item()
+
+                logger.info(
+                    f"[Step {global_step}/{total_steps}] "
+                    f"DINO={avg_dino:.4f} CE={avg_ce:.4f} Total={avg_total:.4f} | "
+                    f"lr={lr_now:.2e} grad_norm={grad_norm:.2f} | "
+                    f"EMA={ema_m:.4f} tau_T={tau_t:.4f} center_norm={center_norm:.3f} | "
+                    f"GPU={gpu_mem_info()} | "
+                    f"{samples_per_sec:.1f}smp/s ETA={fmt_time(eta_seconds)}"
+                )
+
+                # ── DINO Collapse Diagnostics ──
+                if diag:
                     logger.info(
-                        f"Step {global_step} | "
-                        f"DINO: {avg_dino:.4f} | CE: {avg_ce:.4f} | "
-                        f"Total: {avg_total:.4f} | LR: {lr_now:.2e} | "
-                        f"EMA: {ema_m:.4f} | τ_T: {tau_t:.4f}"
+                        f"  [DIAG] H_norm: T={diag['H_norm_T']:.4f} S={diag['H_norm_S']:.4f} | "
+                        f"std(z): T={diag['std_z_T']:.6f} S={diag['std_z_S']:.6f} | "
+                        f"abs(z): T={diag['abs_z_T']:.6f} S={diag['abs_z_S']:.6f} | "
+                        f"R_C={diag['R_C']:.4f} | S_cos={diag['S_cos']:.4f} | "
+                        f"corrupt={diag.get('corrupt_ratio', 0):.1%}"
                     )
+                    # Automated diagnosis
+                    alerts = []
+                    if diag['H_norm_T'] > 0.95:
+                        alerts.append(f"H_norm(T)={diag['H_norm_T']:.3f}>0.95 → Teacher output is UNIFORM (temp/centering issue)")
+                    if diag['H_norm_S'] > 0.95:
+                        alerts.append(f"H_norm(S)={diag['H_norm_S']:.3f}>0.95 → Student output is UNIFORM (lr/init issue)")
+                    if diag['R_C'] > 0.8:
+                        alerts.append(f"R_C={diag['R_C']:.3f}>0.8 → Center is CANCELING logits (centering too aggressive)")
+                    if diag['S_cos'] > 0.9:
+                        alerts.append(f"S_cos={diag['S_cos']:.3f}>0.9 → MODE COLLAPSE (all samples → same vector)")
+                    if diag['std_z_T'] < 0.1:
+                        alerts.append(f"std(z_T)={diag['std_z_T']:.6f}<0.1 → Teacher logits have NO discrimination")
+                    if diag['std_z_S'] < 0.1:
+                        alerts.append(f"std(z_S)={diag['std_z_S']:.6f}<0.1 → Student logits have NO discrimination")
+                    for a in alerts:
+                        logger.warning(f"  >>> {a}")
+                    if not alerts:
+                        logger.info(f"  [DIAG] All metrics healthy")
 
-                # Checkpoint
-                if global_step % cfg.save_every_steps == 0:
-                    ckpt_dir = Path(cfg.output_dir) / f"checkpoint-{global_step}"
-                    ckpt_dir.mkdir(exist_ok=True, parents=True)
-                    model.student.save_pretrained(ckpt_dir)
-                    tokenizer.save_pretrained(ckpt_dir)
-                    # Save projection heads
-                    torch.save({
-                        "student_head": model.student_head.state_dict(),
-                        "teacher_head": model.teacher_head.state_dict(),
-                        "center": model.center,
-                        "global_step": global_step,
-                        "epoch": epoch,
-                    }, ckpt_dir / "dino_state.pt")
-                    logger.info(f"Checkpoint saved: {ckpt_dir}")
+            # Checkpoint
+            if global_step > 0 and global_step % cfg.save_every_steps == 0 and (batch_idx + 1) % cfg.grad_accum == 0:
+                ckpt_dir = Path(cfg.output_dir) / f"checkpoint-{global_step}"
+                ckpt_dir.mkdir(exist_ok=True, parents=True)
+                model.student.save_pretrained(ckpt_dir)
+                tokenizer.save_pretrained(ckpt_dir)
+                torch.save({
+                    "student_head": model.student_head.state_dict(),
+                    "teacher_head": model.teacher_head.state_dict(),
+                    "center": model.center,
+                    "global_step": global_step,
+                    "epoch": epoch,
+                }, ckpt_dir / "dino_state.pt")
+                logger.info(f"  >> Checkpoint saved: {ckpt_dir}")
 
-        # End of epoch stats
+        # ── End of epoch summary ──
+        epoch_elapsed = time.time() - epoch_start
+        total_elapsed = time.time() - train_start
+        epochs_left = cfg.epochs - (epoch + 1)
+        epoch_eta = epochs_left * epoch_elapsed
+
         avg_dino = epoch_dino_loss / max(1, num_batches)
         avg_ce = epoch_ce_loss / max(1, num_batches)
         avg_total = epoch_total_loss / max(1, num_batches)
-        logger.info(
-            f"Epoch {epoch + 1} complete | "
-            f"DINO: {avg_dino:.4f} | CE: {avg_ce:.4f} | Total: {avg_total:.4f}"
-        )
+
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info(f"  Epoch {epoch + 1}/{cfg.epochs} complete in {fmt_time(epoch_elapsed)}")
+        logger.info(f"  ─────────────────────────────────────")
+        logger.info(f"  DINO loss   : {avg_dino:.4f}  (min={epoch_dino_min:.4f}, max={epoch_dino_max:.4f})")
+        logger.info(f"  CE loss     : {avg_ce:.4f}")
+        logger.info(f"  Total loss  : {avg_total:.4f}")
+        logger.info(f"  LR          : {scheduler.get_last_lr()[0]:.2e}")
+        logger.info(f"  EMA momentum: {get_ema_momentum(global_step, total_steps, cfg.ema_base):.5f}")
+        logger.info(f"  Teacher temp: {get_teacher_temp(global_step, total_steps, cfg.tau_t_start, cfg.tau_t_end):.4f}")
+        logger.info(f"  Center norm : {model.center.norm().item():.4f}")
+        logger.info(f"  GPU memory  : {gpu_mem_info()}")
+        logger.info(f"  ─────────────────────────────────────")
+        logger.info(f"  Elapsed     : {fmt_time(total_elapsed)}")
+        logger.info(f"  Remaining   : ~{fmt_time(epoch_eta)} ({epochs_left} epochs)")
+        logger.info("=" * 60)
+        logger.info("")
+
+        # Track epoch-over-epoch DINO loss trend
+        if prev_dino_loss is not None:
+            delta = avg_dino - prev_dino_loss
+            direction = "↓" if delta < 0 else "↑" if delta > 0 else "→"
+            logger.info(f"  DINO trend  : {prev_dino_loss:.4f} {direction} {avg_dino:.4f} (delta={delta:+.4f})")
+        prev_dino_loss = avg_dino
 
         # Save epoch checkpoint
         epoch_dir = Path(cfg.output_dir) / f"epoch-{epoch + 1}"
@@ -893,7 +931,7 @@ def train(cfg: DINOConfig):
             "global_step": global_step,
             "epoch": epoch,
         }, epoch_dir / "dino_state.pt")
-        logger.info(f"Epoch checkpoint saved: {epoch_dir}")
+        logger.info(f"  >> Epoch checkpoint saved: {epoch_dir}")
 
     # ── Final save (HF-compatible) ──
     final_dir = Path(cfg.output_dir) / "final"
@@ -907,10 +945,16 @@ def train(cfg: DINOConfig):
         "global_step": global_step,
     }, final_dir / "dino_state.pt")
 
+    total_time = time.time() - train_start
+    logger.info("")
     logger.info("=" * 60)
-    logger.info(f"Training complete! Final checkpoint: {final_dir}")
-    logger.info(f"Total steps: {global_step}")
-    logger.info(f"Load with: AutoModelForSeq2SeqLM.from_pretrained('{final_dir}')")
+    logger.info("  TRAINING COMPLETE")
+    logger.info("=" * 60)
+    logger.info(f"  Total time  : {fmt_time(total_time)}")
+    logger.info(f"  Total steps : {global_step}")
+    logger.info(f"  Final DINO  : {prev_dino_loss:.4f}")
+    logger.info(f"  Checkpoint  : {final_dir}")
+    logger.info(f"  Load with   : AutoModelForSeq2SeqLM.from_pretrained('{final_dir}')")
     logger.info("=" * 60)
 
     return model, tokenizer
