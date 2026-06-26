@@ -11,9 +11,7 @@ Model B : mattiaangeli/byt5-akkadian-mbr
 import os
 import gc
 import re
-import json
 import math
-import random
 import logging
 import argparse
 import warnings
@@ -29,6 +27,9 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from tqdm.auto import tqdm
 import sacrebleu
+
+from nmt_dino.preprocessing import OptimizedPreprocessor
+from nmt_dino.postprocessing import VectorizedPostprocessor
 
 warnings.filterwarnings("ignore")
 
@@ -101,146 +102,6 @@ def _bf16_ctx(device: torch.device, enabled: bool):
     if enabled and device.type == "cuda":
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return nullcontext()
-
-
-# ──────────────────────────────────────────────────────────────
-# Preprocessing
-# ──────────────────────────────────────────────────────────────
-
-_V2 = re.compile(r"([aAeEiIuU])(?:2|₂)")
-_V3 = re.compile(r"([aAeEiIuU])(?:3|₃)")
-_ACUTE = str.maketrans({"a":"á","e":"é","i":"í","u":"ú","A":"Á","E":"É","I":"Í","U":"Ú"})
-_GRAVE = str.maketrans({"a":"à","e":"è","i":"ì","u":"ù","A":"À","E":"È","I":"Ì","U":"Ù"})
-
-def _ascii_to_diacritics(s: str) -> str:
-    s = s.replace("sz","š").replace("SZ","Š")
-    s = s.replace("s,","ṣ").replace("S,","Ṣ")
-    s = s.replace("t,","ṭ").replace("T,","Ṭ")
-    s = _V2.sub(lambda m: m.group(1).translate(_ACUTE), s)
-    s = _V3.sub(lambda m: m.group(1).translate(_GRAVE), s)
-    return s
-
-_ALLOWED_FRACS = [
-    (1/6,"0.16666"),(1/4,"0.25"),(1/3,"0.33333"),
-    (1/2,"0.5"),(2/3,"0.66666"),(3/4,"0.75"),(5/6,"0.83333"),
-]
-_FRAC_TOL = 2e-3
-_FLOAT_RE = re.compile(r"(?<![\w/])(\d+\.\d{4,})(?![\w/])")
-
-def _canon_decimal(x: float) -> str:
-    ip = int(math.floor(x + 1e-12))
-    frac = x - ip
-    best = min(_ALLOWED_FRACS, key=lambda t: abs(frac - t[0]))
-    if abs(frac - best[0]) <= _FRAC_TOL:
-        dec = best[1]
-        if ip == 0:
-            return dec
-        return f"{ip}{dec[1:]}" if dec.startswith("0.") else f"{ip}+{dec}"
-    return f"{x:.5f}".rstrip("0").rstrip(".")
-
-_GAP_UNIFIED_RE = re.compile(
-    r"<\s*big[\s_\-]*gap\s*>|<\s*gap\s*>|\bbig[\s_\-]*gap\b"
-    r"|\bx(?:\s+x)+\b|\.{3,}|…+|\[\.+\]|\[\s*x\s*\]|\(\s*x\s*\)"
-    r"|(?<!\w)x{2,}(?!\w)|(?<!\w)x(?!\w)"
-    r"|\(\s*large\s+break\s*\)|\(\s*break\s*\)"
-    r"|\(\s*\d+\s+broken\s+lines?\s*\)", re.I
-)
-_CHAR_TRANS = str.maketrans({
-    "ḫ":"h","Ḫ":"H","ʾ":"",
-    "₀":"0","₁":"1","₂":"2","₃":"3","₄":"4",
-    "₅":"5","₆":"6","₇":"7","₈":"8","₉":"9",
-    "—":"-","–":"-",
-})
-_UNICODE_UPPER = r"A-ZŠṬṢḪ\u00C0-\u00D6\u00D8-\u00DE\u0160\u1E00-\u1EFF"
-_UNICODE_LOWER = r"a-zšṭṣḫ\u00E0-\u00F6\u00F8-\u00FF\u0161\u1E01-\u1EFF"
-_DET_UPPER_RE = re.compile(r"\(([" + _UNICODE_UPPER + r"0-9]{1,6})\)")
-_DET_LOWER_RE = re.compile(r"\(([" + _UNICODE_LOWER + r"]{1,4})\)")
-_KUBABBAR_RE = re.compile(r"KÙ\.B\.")
-_WS_RE = re.compile(r"\s+")
-_EXACT_FRAC_RE = re.compile(r"0\.8333|0\.6666|0\.3333|0\.1666|0\.625|0\.75|0\.25|0\.5")
-_EXACT_FRAC_MAP = {"0.8333":"⅚","0.6666":"⅔","0.3333":"⅓","0.1666":"⅙","0.625":"⅝","0.75":"¾","0.25":"¼","0.5":"½"}
-
-def _frac_repl(m: re.Match) -> str:
-    return _EXACT_FRAC_MAP[m.group(0)]
-
-class OptimizedPreprocessor:
-    def preprocess_batch(self, texts: List[str]) -> List[str]:
-        ser = pd.Series(texts).fillna("").astype(str)
-        ser = ser.apply(_ascii_to_diacritics)
-        ser = ser.str.replace(_DET_UPPER_RE, r"\1", regex=True)
-        ser = ser.str.replace(_DET_LOWER_RE, r"{\1}", regex=True)
-        ser = ser.str.replace(_GAP_UNIFIED_RE, "<gap>", regex=True)
-        ser = ser.str.translate(_CHAR_TRANS)
-        ser = ser.str.replace("ₓ", "", regex=False)
-        ser = ser.str.replace(_KUBABBAR_RE, "KÙ.BABBAR", regex=True)
-        ser = ser.str.replace(_EXACT_FRAC_RE, _frac_repl, regex=True)
-        ser = ser.str.replace(_FLOAT_RE, lambda m: _canon_decimal(float(m.group(1))), regex=True)
-        ser = ser.str.replace(_WS_RE, " ", regex=True).str.strip()
-        return ser.tolist()
-
-
-# ──────────────────────────────────────────────────────────────
-# Post-processing
-# ──────────────────────────────────────────────────────────────
-
-_SOFT_GRAM_RE   = re.compile(r"\(\s*(?:fem|plur|pl|sing|singular|plural|\?|\!)(?:\.\s*(?:plur|plural|sing|singular))?\.?\s*[^)]*\)", re.I)
-_BARE_GRAM_RE   = re.compile(r"(?<!\w)(?:fem|sing|pl|plural)\.?(?!\w)\s*", re.I)
-_UNCERTAIN_RE   = re.compile(r"\(\?\)")
-_CURLY_QUOT_RE  = re.compile("[\u201c\u201d\u2018\u2019]")
-_MONTH_RE       = re.compile(r"\bMonth\s+(XII|XI|X|IX|VIII|VII|VI|V|IV|III|II|I)\b", re.I)
-_ROMAN2INT      = {"I":1,"II":2,"III":3,"IV":4,"V":5,"VI":6,"VII":7,"VIII":8,"IX":9,"X":10,"XI":11,"XII":12}
-_REPEAT_WORD_RE = re.compile(r"\b(\w+)(?:\s+\1\b)+")
-_REPEAT_PUNCT_RE= re.compile(r"([.,])\1+")
-_PUNCT_SPC_RE   = re.compile(r"\s+([.,:])")
-_FORBIDDEN_TRANS= str.maketrans("","","()——<>⌈⌋⌊[]+ʾ;")
-_COMMODITY_RE   = re.compile(r"-(gold|tax|textiles)\b")
-_COMMODITY_REPL = {"gold":"pašallum gold","tax":"šadduātum tax","textiles":"kutānum textiles"}
-_SHEKEL_REPLS   = [
-    (re.compile(r"5\s+11\s*/\s*12\s+shekels?", re.I), "6 shekels less 15 grains"),
-    (re.compile(r"5\s*/\s*12\s+shekels?", re.I),      "⅔ shekel 15 grains"),
-    (re.compile(r"7\s*/\s*12\s+shekels?", re.I),      "½ shekel 15 grains"),
-    (re.compile(r"1\s*/\s*12\s*(?:\(shekel\)|\bshekel)?", re.I), "15 grains"),
-]
-_SLASH_ALT_RE   = re.compile(r"(?<!\d)\s*/\s*(?!\d)\S+")
-_STRAY_MARKS_RE = re.compile(r"<<[^>]*>>|<(?!gap\b)[^>]*>")
-_MULTI_GAP_RE   = re.compile(r"(?:<gap>\s*){2,}")
-_PN_RE          = re.compile(r"\bPN\b")
-
-def _month_repl(m: re.Match) -> str:
-    return f"Month {_ROMAN2INT.get(m.group(1).upper(), m.group(1))}"
-
-def _commodity_repl(m: re.Match) -> str:
-    return _COMMODITY_REPL[m.group(1)]
-
-class VectorizedPostprocessor:
-    def postprocess_batch(self, translations: List[str]) -> List[str]:
-        s = pd.Series(translations).fillna("").astype(str)
-        s = s.str.replace(_GAP_UNIFIED_RE, "<gap>", regex=True)
-        s = s.str.replace(_PN_RE, "<gap>", regex=True)
-        s = s.str.replace(_COMMODITY_RE, _commodity_repl, regex=True)
-        for pat, repl in _SHEKEL_REPLS:
-            s = s.str.replace(pat, repl, regex=True)
-        s = s.str.replace(_EXACT_FRAC_RE, _frac_repl, regex=True)
-        s = s.str.replace(_FLOAT_RE, lambda m: _canon_decimal(float(m.group(1))), regex=True)
-        s = s.str.replace(_SOFT_GRAM_RE, " ", regex=True)
-        s = s.str.replace(_BARE_GRAM_RE, " ", regex=True)
-        s = s.str.replace(_UNCERTAIN_RE, "", regex=True)
-        s = s.str.replace(_STRAY_MARKS_RE, "", regex=True)
-        s = s.str.replace(_SLASH_ALT_RE, "", regex=True)
-        s = s.str.replace(_CURLY_QUOT_RE, "", regex=True)
-        s = s.str.replace(_MONTH_RE, _month_repl, regex=True)
-        s = s.str.replace(_MULTI_GAP_RE, "<gap>", regex=True)
-        s = s.str.replace("<gap>", "\x00GAP\x00", regex=False)
-        s = s.str.translate(_FORBIDDEN_TRANS)
-        s = s.str.replace("\x00GAP\x00", " <gap> ", regex=False)
-        s = s.str.replace(_REPEAT_WORD_RE, r"\1", regex=True)
-        for n in range(4, 1, -1):
-            pat = r"\b((?:\w+\s+){" + str(n-1) + r"}\w+)(?:\s+\1\b)+"
-            s = s.str.replace(pat, r"\1", regex=True)
-        s = s.str.replace(_PUNCT_SPC_RE, r"\1", regex=True)
-        s = s.str.replace(_REPEAT_PUNCT_RE, r"\1", regex=True)
-        s = s.str.replace(_WS_RE, " ", regex=True).str.strip()
-        return s.tolist()
 
 
 # ──────────────────────────────────────────────────────────────

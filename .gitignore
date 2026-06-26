@@ -3,3 +3,13 @@ __pycache__/
 *.pyc
 dino_output/
 *.log
+.ipynb_checkpoints/
+dino_ema_output/
+outputs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+submission.csv
+submission_*.csv
+wandb/
